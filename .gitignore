@@ -1,0 +1,15 @@
+# ignore everything by default; allowlist only paper-relevant code below
+*
+
+!.gitignore
+!README.md
+!requirements.txt
+!LICENSE
+
+!sim/
+sim/*
+!sim/engine.py
+!sim/graph_layouts.py
+!sim/run_m1.py
+!sim/run_m2.py
+!sim/run_m3.py
