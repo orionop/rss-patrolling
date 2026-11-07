@@ -505,7 +505,7 @@ def load_iitb_graphml(path: str, n_ghosts: int = 6,
 IITB_GRAPHML = "../upstream/mrpp_sumo/graph_ml/iitb.graphml"
 
 
-def make_ladder(rows: int = 7, cols: int = 7, n_ghosts: int = 5,
+def make_ladder(rows: int = 10, cols: int = 10, n_ghosts: int = 5,
                  n_priorities: int = 6, seed: int = 0) -> List[Layout]:
     G1, pos1 = build_grid(rows, cols)
     priorities1 = pick_priorities(G1, n_priorities, pos1, seed=seed)

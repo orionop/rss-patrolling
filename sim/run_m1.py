@@ -11,6 +11,7 @@ from engine import Sim, VARIANTS
 HORIZON_S = 3600 * 2   # 2 simulated hours, placeholder; revisit once first results are in
 FLEET_SIZES = [(4, 2), (6, 3)]
 SEEDS = [0, 1, 2]       # multiple seeds per condition, per Sec "Statistical protocol"
+T_HOPS = 20   # 10x10 grid's worst priority-pair shortest path is 15 hops; 20 covers it with margin
 
 
 def run_all():
@@ -20,7 +21,8 @@ def run_all():
     for n_ugv, n_uav in FLEET_SIZES:
         for variant_key, variant in VARIANTS.items():
             for seed in SEEDS:
-                sim = Sim(m1, n_ugv=n_ugv, n_uav=n_uav, variant=variant, seed=seed)
+                sim = Sim(m1, n_ugv=n_ugv, n_uav=n_uav, variant=variant, seed=seed,
+                          t_hops=T_HOPS)
                 log = sim.run(HORIZON_S)
                 final = log[-1] if log else {}
                 results.append({

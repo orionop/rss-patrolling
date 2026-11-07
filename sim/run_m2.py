@@ -13,11 +13,10 @@ from engine import Sim, VARIANTS
 HORIZON_S = 3600 * 2   # same horizon as M1, placeholder
 FLEET_SIZES = [(4, 2), (6, 3)]
 SEEDS = [0, 1, 2]
-T_HOPS = 18   # M1's default of 8 is too small here: M2's thinning pushes every
-              # priority-pair shortest path to 10-16 hops, and some ghosts'
-              # nearest node sits 9-15 hops out, so t_hops=8 made them
-              # structurally unreachable regardless of variant. 18 covers the
-              # worst observed pair (16) with margin.
+T_HOPS = 40   # 10x10 grid's thinning pushes the worst priority-pair shortest
+              # path to 34 hops; 40 covers it with margin (same reasoning as
+              # before -- too small a cutoff makes far priority/ghost pairs
+              # structurally unreachable regardless of variant).
 
 
 def run_all():
