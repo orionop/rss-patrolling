@@ -506,7 +506,10 @@ IITB_GRAPHML = "../upstream/mrpp_sumo/graph_ml/iitb.graphml"
 
 
 def make_ladder(rows: int = 10, cols: int = 10, n_ghosts: int = 5,
-                 n_priorities: int = 6, seed: int = 0) -> List[Layout]:
+                 n_priorities: int = 6, seed: int = 0,
+                 include_m3: bool = False) -> List[Layout]:
+    """Returns [M1, M2] by default. M3 (Boston OSM) is only built when
+    include_m3=True, because it needs osmnx and an internet download."""
     G1, pos1 = build_grid(rows, cols)
     priorities1 = pick_priorities(G1, n_priorities, pos1, seed=seed)
     priority_pos1 = [pos1[p] for p in priorities1]
@@ -517,13 +520,13 @@ def make_ladder(rows: int = 10, cols: int = 10, n_ghosts: int = 5,
     G2 = thin_edges(G1, pos1, drop_fraction=0.43, seed=seed + 1,
                      protect_nodes=ghost_nearest_nodes, priorities=priorities1)
 
-    m3 = load_osm_city((42.3601, -71.0589), seed=seed)  # Boston, USA
-
-    return [
+    ladder = [
         Layout("M1 (full grid)", G1, ghosts1, priorities1, pos1),
         Layout("M2 (grid, near-tree)", G2, ghosts1, priorities1, pos1),
-        m3,
     ]
+    if include_m3:
+        ladder.append(load_osm_city((42.3601, -71.0589), seed=seed))  # Boston, USA
+    return ladder
 
 
 def plot_layout(layout: Layout, ax, scale: float = 1.0, edge_color: str = "#78828C"):
@@ -548,7 +551,7 @@ def plot_layout(layout: Layout, ax, scale: float = 1.0, edge_color: str = "#7882
 
 
 def main():
-    ladder = make_ladder()
+    ladder = make_ladder(include_m3=True)
     legend_elems = [
         plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="white",
                    markeredgecolor="#546E7A", markersize=9, label="ground node $V_g$"),

@@ -11,6 +11,7 @@ Usage once approved:
 """
 from graph_layouts import make_ladder
 from engine import Sim, VARIANTS, EventConfig
+from runner import summarize
 
 HORIZON_S = 3600 * 2
 FLEET_SIZES = [(8, 4), (10, 5), (10, 7)]
@@ -25,7 +26,7 @@ CONDITIONS = {
 
 
 def run_all():
-    ladder = make_ladder()
+    ladder = make_ladder(include_m3=True)
     m3 = ladder[2]
     full = VARIANTS["full"]
     results = []
@@ -41,9 +42,8 @@ def run_all():
                     "fleet": f"{n_ugv}-{n_uav}",
                     "condition": cond_key,
                     "seed": seed,
-                    "mean_idleness": final.get("mean_idleness"),
-                    "ghost_mean_idleness": final.get("ghost_mean_idleness"),
-                    "ghost_max_idleness": final.get("ghost_max_idleness"),
+                    **{k: round(v, 2) for k, v in summarize(log).items()},
+                    # event stats are cumulative over the run, so the final value is the run total
                     "event_mean_response": final.get("event_mean_response"),
                     "event_max_response": final.get("event_max_response"),
                     "events_resolved": final.get("events_resolved"),

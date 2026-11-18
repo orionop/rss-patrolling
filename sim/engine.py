@@ -15,6 +15,7 @@ travel distance -- acceptable at DT small relative to r_max / v_g.
 """
 from __future__ import annotations
 
+import itertools
 import math
 import random
 from dataclasses import dataclass, field
@@ -70,13 +71,21 @@ class Weights:
     c6: float = 1.5
     c7: float = 2.0
     c8: float = 1.0
+    ghost_units_seconds: bool = False  # ghost credit hinge uses walk travel time in seconds instead of node count
+    discount_others: float = 0.0  # EXTENSION (overlap discount): scale the idleness credit of nodes on other UGVs' remaining walks by (1 - this)
     c9: float = 5.0           # emergency diversion weight, severity-scaled (M3 events layer only)
     r_max: float = 70.0       # launch/recovery-credit proximity radius (meters)
     i_min: float = 20.0       # minimum ghost idleness before credit fires
+    T: float = 400.0          # shared priority time period T (seconds): walk travel-time bound and overshoot threshold
+    starve_idleness: Optional[float] = None  # EXTENSION (not in TPBP): if a ground node's idleness exceeds this (s), restrict the choice to eligible walks that cover the stalest such node. None = pure TPBP reward
+    ghost_starve_idleness: Optional[float] = None  # EXTENSION (not in TPBP): if a ghost's idleness exceeds this (s), restrict the choice to eligible walks that pass within r_max of the stalest such ghost (only for variants that launch UAVs by proximity). None = off
+    ghost_cap_idleness: Optional[float] = None  # EXTENSION (not in Sec 3.2): if an unclaimed ghost's idleness exceeds this (s), a docked UAV may launch to it from ANY distance (r_max waived). None = off
     v_g: float = 4.0          # UGV speed, m/s
     s_a: float = 12.0         # UAV speed, m/s (s_a >> v_g, per formulation)
     eps_l: float = 2.0        # rendezvous co-location tolerance (meters)
     landing_candidates: int = 3  # C in Sec 3.3 step 3
+    gate_idleness: Optional[float] = None  # detour gate threshold (s); None = starve_idleness
+    claim_cap: Optional[int] = None  # COVERING SET (final-skeleton Sec 7.4): N_c, most UGVs holding a starvation claim at once. None = old starvation guard
 
 
 # ---------------------------------------------------------------------------
@@ -165,15 +174,431 @@ class UAV:
 # bound T_hops standing in for the shared Time Period T.
 # ---------------------------------------------------------------------------
 
-def enumerate_valid_walks(G: nx.Graph, priorities: List[str], t_hops: int) -> List[List[str]]:
+def enumerate_valid_walks(G: nx.Graph, priorities: List[str], t_hops: int,
+                          walks_per_pair: Optional[int] = None,
+                          detour_walks: bool = True,
+                          t_seconds: Optional[float] = None,
+                          pos: Optional[Dict[str, Coord]] = None,
+                          v_g: Optional[float] = None) -> List[List[str]]:
+    """Valid walks between priority nodes. As in TPBP (Sec III-A) the end node
+    may equal the start node, so closed walks s -> ... -> s are included.
+
+    walks_per_pair=None -> every simple path (every simple cycle when s == f)
+    of <= t_hops hops (exact, but the count grows ~5x for every 2 extra hops,
+    far too large on a dense grid with t_hops ~ 20).
+    walks_per_pair=K -> only the K shortest per ordered pair (still capped at
+    t_hops hops). This approximates the walk set: report K in the paper.
+
+    detour_walks=True additionally adds, for every ordered priority pair (s, f)
+    and every node v, the walk shortest(s, v) + shortest(v, f) whenever it has
+    <= t_hops hops. TPBP valid walks (Sec III-A) need not be simple paths, only
+    shorter than the time period, and without these detours the nodes that lie
+    off the simple paths between priority nodes (44 of 100 on M2) can never be
+    visited at all.
+
+    t_seconds (with pos and v_g) imposes the real time period T: a walk is valid
+    only if its travel time (sum of Euclidean edge lengths / v_g) is <= T, which
+    is L(p) <= T of Sec 2.1. t_hops is then only an enumeration cap, derived
+    from T and the shortest edge."""
+    if t_seconds is not None:
+        min_edge = min(math.dist(pos[u], pos[v]) for u, v in G.edges())
+        t_hops = int(t_seconds * v_g / min_edge + 1e-9)
     walks: List[List[str]] = []
     for s in priorities:
         for f in priorities:
             if s == f:
-                continue
-            for path in nx.all_simple_paths(G, s, f, cutoff=t_hops):
-                walks.append(path)
+                walks.extend(_closed_walks(G, s, t_hops, walks_per_pair))
+            elif walks_per_pair is None:
+                for path in nx.all_simple_paths(G, s, f, cutoff=t_hops):
+                    walks.append(path)
+            else:
+                # shortest_simple_paths yields in increasing hop count, so we
+                # can stop as soon as a path exceeds the cutoff or K is reached
+                for path in itertools.islice(nx.shortest_simple_paths(G, s, f), walks_per_pair):
+                    if len(path) - 1 > t_hops:
+                        break
+                    walks.append(path)
+    if detour_walks:
+        sp = dict(nx.all_pairs_shortest_path(G))
+        seen = {tuple(w) for w in walks}
+        for s in priorities:
+            for f in priorities:
+                for v in G.nodes():
+                    a, b = sp[s][v], sp[v][f]
+                    if len(a) + len(b) - 2 > t_hops:
+                        continue
+                    w = a + b[1:]
+                    if tuple(w) not in seen:
+                        seen.add(tuple(w))
+                        walks.append(w)
+    if t_seconds is not None:
+        def _time(w):
+            return sum(math.dist(pos[a], pos[b]) for a, b in zip(w, w[1:])) / v_g
+        walks = [w for w in walks if _time(w) <= t_seconds + 1e-9]
     return walks
+
+
+def _closed_walks(G: nx.Graph, s: str, t_hops: int,
+                  walks_per_pair: Optional[int]) -> List[List[str]]:
+    """Closed walks s -> n -> ... -> s: a first step to a neighbour n, then a
+    simple path from n back to s (so s -> n -> s out-and-backs are included)."""
+    out: List[List[str]] = []
+    for n in G.neighbors(s):
+        if walks_per_pair is None:
+            for p in nx.all_simple_paths(G, n, s, cutoff=t_hops - 1):
+                out.append([s] + p)
+        else:
+            for p in itertools.islice(nx.shortest_simple_paths(G, n, s), walks_per_pair):
+                if len(p) > t_hops:     # s + p has len(p) hops
+                    break
+                out.append([s] + p)
+    if walks_per_pair is not None:
+        out.sort(key=len)
+        out = out[:walks_per_pair]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Covering walk set (final-skeleton.tex Sec 7, Algorithm alg:cover).
+# Direct walks: K fastest per priority pair within T (ranked by travel time).
+# Off-path nodes U: ground nodes on no direct walk (tails, parallel roads).
+# Detours: greedy from each off-path node's owner (nearest priority node).
+# ---------------------------------------------------------------------------
+
+def _travel_time(w: List[str], pos: Dict[str, Coord], v_g: float) -> float:
+    return sum(math.dist(pos[a], pos[b]) for a, b in zip(w, w[1:])) / v_g
+
+
+def build_cover_walks(G: nx.Graph, priorities: List[str], t_seconds: float,
+                      pos: Dict[str, Coord], v_g: float, K: int = 10,
+                      ghosts: Optional[Dict[str, Coord]] = None,
+                      r_max: float = 70.0, m: int = 3,
+                      pair_cover: int = 0,
+                      ghost_per_start: bool = True,
+                      ghost_per_pair: bool = False,
+                      ghost_sweeps: bool = False,
+                      all_fastest: bool = False,
+                      disjoint: bool = False,
+                      disjoint_covers: bool = False) -> Tuple[List[List[str]], dict]:
+    """Returns (walks, stats). stats: T_star, n_direct, U, n_detours,
+    n_ghost_walks, no_walk (ground nodes on no stored walk).
+
+    pair_cover=r > 0: corridor cover. For every ordered pair (s, f) with
+    d(s, f) <= T, greedily add sweeping walks s -> ... -> f until every node of
+    the corridor {v : d(s, v) + d(v, f) <= T} lies on at least r of them."""
+    T = t_seconds
+    # K <= 0: rule K = |corridor(s, f)| per pair (local, set by the map)
+    Gt = G.copy()
+    for u, v in Gt.edges():
+        Gt[u][v]["tt"] = math.dist(pos[u], pos[v]) / v_g
+    # step 1: one Dijkstra per priority node
+    dist, path = {}, {}
+    for s in priorities:
+        dist[s], path[s] = nx.single_source_dijkstra(Gt, s, cutoff=T, weight="tt")
+    dS = {v: min(dist[s].get(v, math.inf) for s in priorities) for v in G.nodes()}
+    owner = {v: min(priorities, key=lambda s: dist[s].get(v, math.inf)) for v in G.nodes()}
+    T_star = max(dS[u] + Gt[u][v]["tt"] + dS[v] for u, v in Gt.edges())   # inf if some node is beyond T of every priority node
+    tt = lambda w: _travel_time(w, pos, v_g)
+
+    walks: List[List[str]] = []
+    # step 2: direct walks, K fastest per ordered pair with d(s, f) <= T,
+    # searched inside the pair's corridor {v : d(s, v) + d(v, f) <= T}, which
+    # holds every node of every valid s -> f walk (so the search is exact)
+    INF = math.inf
+    for s in priorities:
+        for f in priorities:
+            if dist[s].get(f, INF) > T + 1e-9:
+                continue
+            corridor = [v for v in dist[s] if dist[s][v] + dist[f].get(v, INF) <= T + 1e-9]
+            H = Gt.subgraph(corridor)
+            Kp = K if K > 0 else len(corridor)
+            if s == f:
+                closed = []
+                for n in H.neighbors(s):
+                    for p in itertools.islice(nx.shortest_simple_paths(H, n, s, weight="tt"), Kp):
+                        w = [s] + p
+                        if tt(w) > T + 1e-9:
+                            break
+                        closed.append(w)
+                closed.sort(key=tt)
+                walks.extend(closed[:Kp])
+            else:
+                for p in itertools.islice(nx.shortest_simple_paths(H, s, f, weight="tt"), Kp):
+                    if tt(p) > T + 1e-9:
+                        break
+                    walks.append(p)
+    # step 2a (optional): every equally fastest route per ordered pair s != f
+    if all_fastest:
+        have = {tuple(w) for w in walks}
+        for s in priorities:
+            for f in priorities:
+                if s != f and dist[s].get(f, math.inf) <= T + 1e-9:
+                    for p in nx.all_shortest_paths(Gt, s, f, weight="tt"):
+                        if tuple(p) not in have:
+                            have.add(tuple(p)); walks.append(p)
+    # step 2a' (optional): edge-disjoint fastest routes per ordered pair s != f:
+    # fastest route, remove its edges, repeat while one fits in T (<= degree many)
+    if disjoint:
+        have = {tuple(w) for w in walks}
+        for s in priorities:
+            for f in priorities:
+                if s == f or dist[s].get(f, math.inf) > T + 1e-9:
+                    continue
+                H = Gt.copy()
+                while True:
+                    try:
+                        t_sf, p = nx.single_source_dijkstra(H, s, f, weight="tt")
+                    except nx.NetworkXNoPath:
+                        break
+                    if t_sf > T + 1e-9:
+                        break
+                    if tuple(p) not in have:
+                        have.add(tuple(p)); walks.append(p)
+                    H.remove_edges_from(zip(p, p[1:]))
+    # step 2c (optional): repeated corridor covers on disjoint streets. Per pair:
+    # cover the corridor, remove the edges used, cover again on what is left,
+    # until no walk fits in T (at most max-degree rounds).
+    if disjoint_covers:
+        for s in priorities:
+            for f in priorities:
+                if dist[s].get(f, math.inf) > T + 1e-9:
+                    continue
+                H = Gt.copy()
+                while True:
+                    ds, ps = nx.single_source_dijkstra(H, s, cutoff=T, weight="tt")
+                    df, pf = nx.single_source_dijkstra(H, f, cutoff=T, weight="tt")
+                    corridor = sorted(v for v in ds if v in df and ds[v] + df[v] <= T + 1e-9)
+                    need = set(v for v in corridor if v not in (s, f))
+                    round_walks = []
+                    while need:
+                        u = max(sorted(need), key=lambda x: ds[x] + df[x])
+                        p = list(ps[u]); t_p = ds[u]; cur = u
+                        while True:
+                            left = need - set(p)
+                            if not left:
+                                break
+                            dc, pc = nx.single_source_dijkstra(H, cur, cutoff=T - t_p, weight="tt")
+                            best, best_score = None, 0.0
+                            for x in sorted(left):
+                                if x not in dc or dc[x] <= 0 or x not in df or t_p + dc[x] + df[x] > T + 1e-9:
+                                    continue
+                                sc = len(set(pc[x]) & left) / dc[x]
+                                if sc > best_score:
+                                    best, best_score = x, sc
+                            if best is None:
+                                break
+                            p += pc[best][1:]; t_p += dc[best]; cur = best
+                        p += list(reversed(pf[cur]))[1:]
+                        round_walks.append(p)
+                        need -= set(p)
+                    if not round_walks:
+                        break
+                    walks.extend(round_walks)
+                    for p in round_walks:
+                        H.remove_edges_from(zip(p, p[1:]))
+    # step 2b (optional): corridor cover per ordered pair
+    n_corridor = 0
+    if pair_cover > 0:
+        for s in priorities:
+            for f in priorities:
+                if dist[s].get(f, math.inf) > T + 1e-9:
+                    continue
+                corridor = [v for v in G.nodes()
+                            if dist[s].get(v, math.inf) + dist[f].get(v, math.inf) <= T + 1e-9]
+                count = {v: 0 for v in corridor}
+                for _ in range(len(corridor) * pair_cover):
+                    need = {v for v in corridor if count[v] < pair_cover}
+                    if not need:
+                        break
+                    u = max(sorted(need), key=lambda x: dist[s][x] + dist[f][x])
+                    p = list(path[s][u])
+                    t_p = dist[s][u]
+                    cur = u
+                    while True:
+                        left = need - set(p)
+                        if not left:
+                            break
+                        dc, pc = nx.single_source_dijkstra(Gt, cur, cutoff=T - t_p, weight="tt")
+                        best, best_score = None, 0.0
+                        for x in sorted(left):
+                            if x not in dc or dc[x] <= 0 or t_p + dc[x] + dist[f][x] > T + 1e-9:
+                                continue
+                            score = len(set(pc[x]) & left) / dc[x]
+                            if score > best_score:
+                                best, best_score = x, score
+                        if best is None:
+                            break
+                        p += pc[best][1:]
+                        t_p += dc[best]
+                        cur = best
+                    p += list(reversed(path[f][cur]))[1:]
+                    if len(p) < 2:
+                        count[u] = pair_cover   # s == f == u: trivial, skip
+                        continue
+                    walks.append(p)
+                    n_corridor += 1
+                    for v in set(p):
+                        if v in count:
+                            count[v] += 1
+    n_direct = len(walks)
+    on_direct = set(n for w in walks for n in w)
+    U = [v for v in G.nodes() if v not in on_direct]
+
+    # step 4: detours, greedy
+    uncovered = set(U)
+    n_detours = 0
+    gated: List[tuple] = []
+    while uncovered:
+        u = max(sorted(uncovered), key=lambda x: dS[x])
+        A = owner[u]
+        if 2 * dS[u] > T + 1e-9:   # T < T*: this node cannot be on any valid walk
+            uncovered.discard(u)
+            continue
+        p = list(path[A][u])
+        t_p = dist[A][u]
+        cur = u
+        while True:
+            left = set(uncovered) - set(p)
+            if not left:
+                break
+            dc, pc = nx.single_source_dijkstra(Gt, cur, cutoff=T - t_p, weight="tt")
+            best, best_score = None, 0.0
+            for x in sorted(left):
+                if x not in dc or dc[x] <= 0:
+                    continue
+                if t_p + dc[x] + dS[x] > T + 1e-9:
+                    continue
+                new = len(set(pc[x]) & left)
+                score = new / dc[x]
+                if score > best_score:
+                    best, best_score = x, score
+            if best is None:
+                break
+            p += pc[best][1:]
+            t_p += dc[best]
+            cur = best
+        # close, preferring the owner A
+        if t_p + dist[A].get(cur, math.inf) <= T + 1e-9:
+            back = list(reversed(path[A][cur]))
+        else:
+            B = owner[cur]
+            back = list(reversed(path[B][cur]))
+        p += back[1:]
+        walks.append(p)
+        gated.append(tuple(p))
+        n_detours += 1
+        uncovered -= set(p)
+
+    # step 5: at least m walks through every launch set
+    n_ghost = 0
+    if ghosts and ghost_sweeps:
+        # for every pair (s, f) and launch set L_h meeting its corridor: one sweep
+        # s -> v (cheapest launch node) -> greedily most new corridor nodes per
+        # second -> f, so the launch walk also does road work
+        for h, hp in ghosts.items():
+            L = sorted(v for v in G.nodes() if math.dist(pos[v], hp) <= r_max)
+            for s in priorities:
+                for f in priorities:
+                    c = min(((dist[s].get(v, math.inf) + dist[f].get(v, math.inf), v) for v in L),
+                            default=(math.inf, None))
+                    if c[0] > T + 1e-9:
+                        continue
+                    corridor = {v for v in G.nodes()
+                                if dist[s].get(v, math.inf) + dist[f].get(v, math.inf) <= T + 1e-9}
+                    v0 = c[1]
+                    p = list(path[s][v0]); t_p = dist[s][v0]; cur = v0
+                    while True:
+                        left = corridor - set(p)
+                        if not left:
+                            break
+                        dc, pc = nx.single_source_dijkstra(Gt, cur, cutoff=T - t_p, weight="tt")
+                        best, best_score = None, 0.0
+                        for x in sorted(left):
+                            if x not in dc or dc[x] <= 0 or t_p + dc[x] + dist[f][x] > T + 1e-9:
+                                continue
+                            sc = len(set(pc[x]) - set(p)) / dc[x]
+                            if sc > best_score:
+                                best, best_score = x, sc
+                        if best is None:
+                            break
+                        p += pc[best][1:]; t_p += dc[best]; cur = best
+                    p += list(reversed(path[f][cur]))[1:]
+                    if len(p) > 1:
+                        walks.append(p)
+                        n_ghost += 1
+    if ghosts and ghost_per_pair:
+        # for every pair (s, f) whose corridor meets launch set L_h, one walk
+        # s -> v -> f through L_h (cheapest v), unless the pair already has one
+        for h, hp in ghosts.items():
+            L = [v for v in G.nodes() if math.dist(pos[v], hp) <= r_max]
+            Lset = set(L)
+            for s in priorities:
+                for f in priorities:
+                    if any(w[0] == s and w[-1] == f and Lset.intersection(w) for w in walks):
+                        continue
+                    best = min(((dist[s].get(v, math.inf) + dist[f].get(v, math.inf), v) for v in sorted(L)),
+                               default=(math.inf, None))
+                    if best[0] > T + 1e-9:
+                        continue
+                    v = best[1]
+                    w = list(path[s][v]) + list(reversed(path[f][v]))[1:]
+                    if len(w) > 1:
+                        walks.append(w)
+                        n_ghost += 1
+    elif ghosts and ghost_per_start:
+        # m walks through every launch set FROM EVERY priority node s:
+        # s -> v -> f for launch nodes v, ends f by time, cheapest first
+        for h, hp in ghosts.items():
+            L = [v for v in G.nodes() if math.dist(pos[v], hp) <= r_max]
+            for s in priorities:
+                have = sum(1 for w in walks if w[0] == s and any(v in L for v in w))
+                cands = []
+                for v in L:
+                    for f in priorities:
+                        t = dist[s].get(v, math.inf) + dist[f].get(v, math.inf)
+                        if t <= T + 1e-9:
+                            cands.append((t, v, f))
+                cands.sort()
+                used_v = set()
+                for t, v, f in cands:
+                    if have >= m:
+                        break
+                    if (v, f) in used_v:
+                        continue
+                    w = list(path[s][v]) + list(reversed(path[f][v]))[1:]
+                    if len(w) > 1:
+                        walks.append(w)
+                        used_v.add((v, f))
+                        have += 1
+                        n_ghost += 1
+    elif ghosts:
+        for h, hp in ghosts.items():
+            L = [v for v in G.nodes() if math.dist(pos[v], hp) <= r_max]
+            have = sum(1 for w in walks if any(v in L for v in w))
+            for v in sorted(L, key=lambda x: dS[x]):
+                if have >= m:
+                    break
+                if 2 * dS[v] > T + 1e-9:
+                    continue
+                A = owner[v]
+                w = list(path[A][v]) + list(reversed(path[A][v]))[1:]
+                if len(w) > 1:
+                    walks.append(w)
+                    have += 1
+                    n_ghost += 1
+
+    # step 6: dedupe, keep order
+    seen, out = set(), []
+    for w in walks:
+        if tuple(w) not in seen:
+            seen.add(tuple(w))
+            out.append(w)
+    covered = set(n for w in out for n in w)
+    stats = dict(T_star=T_star, n_direct=n_direct, n_corridor=n_corridor, U=len(U), n_detours=n_detours,
+                 n_ghost_walks=n_ghost, walks=len(out),
+                 no_walk=sum(1 for v in G.nodes() if v not in covered),
+                 gated=gated)
+    return out, stats
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +610,12 @@ class Sim:
                  variant: VariantConfig, weights: Weights = None,
                  t_hops: int = 8, seed: int = 0, dt: float = 1.0,
                  events: EventConfig = None, record_traj: bool = False,
-                 traj_stride: int = 5):
+                 traj_stride: int = 5,
+                 valid_walks: Optional[List[List[str]]] = None,
+                 walks_per_pair: Optional[int] = None,
+                 track_node_idleness: bool = False,
+                 t_seconds: Optional[float] = None,
+                 gated_walks: Optional[set] = None):
         self.layout = layout
         self.G = layout.G
         self.pos = layout.pos
@@ -205,7 +635,62 @@ class Sim:
         for (u, v), l in list(self.edge_len.items()):
             self.edge_len[(v, u)] = l
 
-        self.valid_walks = enumerate_valid_walks(self.G, self.priorities, t_hops)
+        # Pass valid_walks in to reuse one precomputed list across many runs
+        # (the list depends only on the graph, priorities and t_hops).
+        if valid_walks is None:
+            valid_walks = enumerate_valid_walks(self.G, self.priorities, t_hops,
+                                                walks_per_pair=walks_per_pair,
+                                                t_seconds=t_seconds, pos=self.pos,
+                                                v_g=self.w.v_g)
+        self.valid_walks = valid_walks
+        # Gated walks (covering-set detours, final-skeleton Sec 7): not in the
+        # normal argmax; only a starvation claim can send a UGV on one.
+        self._gated = set(gated_walks or ())
+        # index by start node (keeps the original order within each start)
+        self._walks_by_start: Dict[str, List[List[str]]] = {}
+        self._gated_by_start: Dict[str, List[List[str]]] = {}
+        for w in self.valid_walks:
+            if tuple(w) in self._gated:
+                self._gated_by_start.setdefault(w[0], []).append(w)
+                continue
+            self._walks_by_start.setdefault(w[0], []).append(w)
+        # the graph is static: all-pairs hop distances once, not a BFS per walk
+        self._sp = dict(nx.all_pairs_shortest_path_length(self.G))
+
+        # Starvation claims (final-skeleton Sec 7.4), only when claim_cap is set
+        self.claim_queue: List[str] = []
+        self.claims: Dict[str, dict] = {}   # UGV id -> {node, walk, target}
+        self.n_claims_made = 0
+        if self.w.claim_cap is not None:
+            Gt = self.G.copy()
+            for u, v in Gt.edges():
+                Gt[u][v]["tt"] = self.edge_len[(u, v)] / self.w.v_g
+            self._ptime = {s: nx.single_source_dijkstra_path_length(Gt, s, weight="tt")
+                           for s in self.priorities}
+            self._GS = nx.Graph()
+            self._GS.add_nodes_from(self.priorities)
+            for s in self.priorities:
+                for f in self.priorities:
+                    if s != f and self._ptime[s].get(f, math.inf) <= self.w.T + 1e-9:
+                        self._GS.add_edge(s, f)
+            self._cover_walk_of: Dict[str, List[str]] = {}
+            # claims only for off-path nodes: those on no ungated walk
+            on_free = set(v for wk in self.valid_walks if tuple(wk) not in self._gated for v in wk)
+            self._claim_nodes = set(v for wk in self.valid_walks for v in wk) - on_free
+            # claim_cap = -1: rule N_c = ceil(n_UGV * |U| / |V_g|), fleet share = load share
+            if self.w.claim_cap == -1:
+                self.w.claim_cap = math.ceil(n_ugv * len(self._claim_nodes) / self.G.number_of_nodes())
+            self._hop_walk: Dict[Tuple[str, str], List[str]] = {}
+            for wk in self.valid_walks:
+                t = self._walk_time(wk)
+                for v in set(wk):
+                    cur = self._cover_walk_of.get(v)
+                    if cur is None or t < self._walk_time(cur):
+                        self._cover_walk_of[v] = wk
+                key = (wk[0], wk[-1])
+                cur = self._hop_walk.get(key)
+                if wk[0] != wk[-1] and tuple(wk) not in self._gated and (cur is None or t < self._walk_time(cur)):
+                    self._hop_walk[key] = wk
 
         self.t = 0.0
         self.last_visit: Dict[str, float] = {n: 0.0 for n in self.G.nodes()}
@@ -223,6 +708,14 @@ class Sim:
         # once, used instead of the live radius check
         self.fixed_launch_nodes = self._pick_fixed_launch_nodes()
 
+        # Optional per-node bookkeeping (off by default so batch runs cost
+        # nothing extra): running time-average and peak idleness of every node.
+        self._track_nodes = track_node_idleness
+        self._idle_nodes: List[str] = list(self.G.nodes()) + list(self.ghosts)
+        self._idle_sum: Dict[str, float] = {n: 0.0 for n in self._idle_nodes}
+        self._idle_max: Dict[str, float] = {n: 0.0 for n in self._idle_nodes}
+        self._idle_steps = 0
+
         self.metrics_log: List[dict] = []
         self.record_traj = record_traj
         self.traj_stride = traj_stride
@@ -231,8 +724,14 @@ class Sim:
     # -- setup ---------------------------------------------------------
 
     def _init_fleet(self, n_ugv: int, n_uav: int):
-        nodes = list(self.G.nodes())
-        start_nodes = self.rng.sample(nodes, min(n_ugv, len(nodes)))
+        # TPBP (Sec III-A): agents start on distinct Priority Nodes, no two on
+        # the same node until every Priority Node is covered.
+        pri = list(self.priorities)
+        if n_ugv <= len(pri):
+            start_nodes = self.rng.sample(pri, n_ugv)
+        else:
+            start_nodes = self.rng.sample(pri, len(pri)) + \
+                [self.rng.choice(pri) for _ in range(n_ugv - len(pri))]
         for i, n0 in enumerate(start_nodes):
             self.ugvs.append(UGV(uid=f"g{i}", pos_node=n0))
         if not self.variant.ugv_only:
@@ -275,18 +774,55 @@ class Sim:
             return 0.0
         return self.t - self.last_visit[node]
 
+    def node_idleness(self) -> Dict[str, float]:
+        """Current idleness (seconds since last visit) of every node: ground
+        nodes (including priority nodes) and ghost nodes, keyed by node id."""
+        return {n: self.idleness(n) for n in self._idle_nodes}
+
+    def node_idleness_stats(self) -> Dict[str, Dict[str, float]]:
+        """Per-node time-average and peak idleness so far. Needs
+        Sim(..., track_node_idleness=True)."""
+        if not self._track_nodes:
+            raise RuntimeError("construct Sim with track_node_idleness=True")
+        steps = max(self._idle_steps, 1)
+        return {n: {"avg": self._idle_sum[n] / steps, "max": self._idle_max[n]}
+                for n in self._idle_nodes}
+
     def visit(self, node: str):
         self.last_visit[node] = self.t
 
     # -- reward: base TPBP + ghost credit + recovery credit --------------
 
-    def walk_reward(self, g: UGV, walk: List[str]) -> Tuple[float, Optional[str], Optional[str]]:
+    def _others_of(self, g: UGV) -> set:
+        others = set()
+        for og in self.ugvs:
+            if og is not g and og.walk:
+                others.update(og.walk[og.walk_idx:])
+        return others
+
+    def walk_reward(self, g: UGV, walk: List[str],
+                    unclaimed_priorities: Optional[List[str]] = None) -> Tuple[float, Optional[str], Optional[str]]:
         """Returns (reward, credited_launch_ghost_or_None, credited_recovery_ghost_or_None)."""
         w = self.w
-        term1 = sum(self.idleness(v) for v in walk) * w.c1
-        term2 = sum(max(self.idleness(s) - 0.0, 0.0) for s in walk if s in self.priorities) * w.c2
-        unclaimed_priorities = [s for s in self.priorities if s not in self._destinations_in_use()]
-        term3 = sum(nx.shortest_path_length(self.G, walk[-1], s) for s in unclaimed_priorities) * w.c3
+        # TPBP Term 1: idleness of the nodes COVERED by the walk, so a node that a
+        # (non-simple) walk passes twice counts once
+        covered = set(walk)
+        if getattr(self.w, "discount_others", 0.0) > 0:
+            others = getattr(self, "_others_cache", None)
+            if others is None:  # outside a decision: build on demand
+                others = self._others_of(g)
+            term1 = sum(self.idleness(v) * (1.0 - self.w.discount_others if v in others else 1.0) for v in covered) * w.c1
+        else:
+            term1 = sum(self.idleness(v) for v in covered) * w.c1
+        # Y(t) = S \ X(t): priority nodes not claimed by other agents
+        if unclaimed_priorities is None:
+            in_use = self._destinations_in_use(exclude=g)
+            unclaimed_priorities = [s for s in self.priorities if s not in in_use]
+        Y = set(unclaimed_priorities)
+        # TPBP: Term 2 sums over s_j in p ∩ Y; Term 3 uses dist(p, s_j), the
+        # shortest distance to s_j from ANY node of the walk
+        term2 = sum(max(self.idleness(s) - w.T, 0.0) for s in covered if s in Y) * w.c2   # [I_s - T]+, T in seconds
+        term3 = sum(min(self._sp[v][sj] for v in walk) for sj in unclaimed_priorities) * w.c3
         term4 = len(walk) * w.c4
         reward = term1 + term2 - term3 - term4
 
@@ -302,7 +838,10 @@ class Sim:
                 launch_set_hit = any(math.dist(self.pos[n], hp) <= w.r_max for n in walk)
                 if launch_set_hit:
                     ihat = self.idleness(h)
-                    t_h = len(walk)  # remaining walk time proxy, hop-based
+                    if getattr(w, "ghost_units_seconds", False):
+                        t_h = sum(self.edge_len[(walk[i], walk[i + 1])] for i in range(len(walk) - 1)) / w.v_g
+                    else:
+                        t_h = len(walk)  # remaining walk time proxy, hop-based
                     reward += w.c5 * (ihat + w.c6 * max(ihat - t_h, 0.0))
                     credited_launch = h
                     break  # credit at most one ghost per walk, nearest match first
@@ -333,18 +872,142 @@ class Sim:
 
         return reward, credited_launch, credited_recovery
 
-    def _destinations_in_use(self) -> set:
-        return {g.walk[-1] for g in self.ugvs if g.walk}
+    def _destinations_in_use(self, exclude: Optional[UGV] = None) -> set:
+        """X(t): destination priority nodes of the OTHER agents (TPBP Sec III-B)."""
+        return {g.walk[-1] for g in self.ugvs if g.walk and g is not exclude}
+
+    def _near_ghost_nodes(self, h: str) -> set:
+        """Ground nodes within r_max of ghost h (cached; the graph is static)."""
+        cache = self.__dict__.setdefault("_near_cache", {})
+        if h not in cache:
+            hp = self.ghosts[h]
+            cache[h] = {n for n in self.G.nodes() if math.dist(self.pos[n], hp) <= self.w.r_max}
+        return cache[h]
+
+    # -- starvation claims (final-skeleton Sec 7.4) ------------------------
+
+    def _walk_time(self, w: List[str]) -> float:
+        return sum(self.edge_len[(a, b)] for a, b in zip(w, w[1:])) / self.w.v_g
+
+    def _remaining_time(self, g: UGV) -> float:
+        if not g.walk or g.walk_idx >= len(g.walk):
+            return 0.0
+        rest = self._walk_time(g.walk[g.walk_idx - 1:])
+        return max(rest - g.edge_progress / self.w.v_g, 0.0)
+
+    def _update_claims(self):
+        thr = self.w.starve_idleness
+        if self.w.claim_cap is None or thr is None:
+            return
+        on_claimed = set()
+        for c in self.claims.values():
+            on_claimed.update(c["walk"])
+        # drop queued nodes that were visited meanwhile
+        self.claim_queue = [v for v in self.claim_queue if self.idleness(v) > thr]
+        queued = set(self.claim_queue)
+        for v in sorted(self.G.nodes(), key=self.idleness, reverse=True):
+            if self.idleness(v) <= thr:
+                break
+            if v not in queued and v not in on_claimed and v in self._claim_nodes:
+                self.claim_queue.append(v)
+                queued.add(v)
+        while len(self.claims) < self.w.claim_cap and self.claim_queue:
+            v = self.claim_queue.pop(0)
+            pv = self._cover_walk_of[v]
+            sv = pv[0]
+            best, best_t = None, math.inf
+            for g in self.ugvs:
+                if g.uid in self.claims or g.reserved_for is not None:
+                    continue
+                end = g.walk[-1] if g.walk and g.walk_idx < len(g.walk) else g.pos_node
+                t = self._remaining_time(g) + self._ptime[sv].get(end, math.inf)
+                if t < best_t:
+                    best, best_t = g, t
+            if best is None:
+                self.claim_queue.insert(0, v)
+                break
+            self.claims[best.uid] = {"node": v, "walk": pv, "target": sv}
+            self.n_claims_made += 1
+
+    def _claim_walk(self, g: UGV) -> Optional[List[str]]:
+        """Next walk for a UGV holding a claim, ignoring Y(t); None = release."""
+        c = self.claims.get(g.uid)
+        if c is None:
+            return None
+        here = g.pos_node
+        if here == c["target"]:
+            del self.claims[g.uid]
+            return c["walk"]
+        if here not in self._GS or not nx.has_path(self._GS, here, c["target"]):
+            del self.claims[g.uid]
+            return None
+        nxt = nx.shortest_path(self._GS, here, c["target"])[1]
+        hop = self._hop_walk.get((here, nxt))
+        if hop is None:
+            del self.claims[g.uid]
+            return None
+        return hop
 
     def select_walk(self, g: UGV):
-        candidates = [w for w in self.valid_walks if w[0] == g.pos_node]
+        if self.w.claim_cap is not None and g.uid in self.claims:
+            cw = self._claim_walk(g)
+            if cw is not None:
+                g.walk = cw
+                g.walk_idx = 1
+                g.edge_progress = 0.0
+                return
+        candidates = self._walks_by_start.get(g.pos_node)
+        # gate opens: a gated detour from here becomes a candidate once one of
+        # its nodes is past the starvation threshold
+        thr_g = self.w.gate_idleness if self.w.gate_idleness is not None else self.w.starve_idleness
+        if thr_g is not None and self._gated_by_start.get(g.pos_node):
+            opened = [w for w in self._gated_by_start[g.pos_node]
+                      if any(self.idleness(v) > thr_g for v in w)]
+            if opened:
+                candidates = (candidates or []) + opened
         if not candidates:
-            candidates = [w for w in self.valid_walks]  # fallback: any walk, teleport-free not guaranteed
+            candidates = self.valid_walks  # fallback: any walk, teleport-free not guaranteed
+        # same for every candidate walk in this call, so compute once
+        in_use = self._destinations_in_use(exclude=g)      # X(t)
+        unclaimed = [s for s in self.priorities if s not in in_use]   # Y(t)
+        # TPBP: only walks ending in Y(t) are eligible (so two agents never
+        # head for the same priority node); the agent's own node is in Y.
+        eligible = [w for w in candidates if w[-1] in unclaimed]
+        if eligible:
+            candidates = eligible
+        # Starvation guard (extension, off by default): TPBP's sum-of-idleness
+        # reward can ignore a stale node that only short walks reach.
+        thr = self.w.starve_idleness
+        if thr is not None:   # guard for nodes on normal walks; claims handle off-path nodes
+            for v in sorted(self.G.nodes(), key=self.idleness, reverse=True):
+                if self.idleness(v) <= thr:
+                    break
+                hit = [w for w in candidates if v in w]
+                if hit:
+                    candidates = hit
+                    break
+        # Ghost starvation guard (extension, off by default): a ghost is only
+        # serviced when a UGV passes within r_max of it, so when one has gone
+        # stale, prefer walks that pass within r_max of the stalest such ghost.
+        gthr = self.w.ghost_starve_idleness
+        if (gthr is not None and not self.variant.ugv_only and self.variant.radius_launch
+                and g.docked_uav is not None):
+            for h in sorted(self.ghosts, key=self.idleness, reverse=True):
+                if self.idleness(h) <= gthr:
+                    break
+                near = self._near_ghost_nodes(h)
+                hit = [w for w in candidates if near.intersection(w)]
+                if hit:
+                    candidates = hit
+                    break
         best, best_r, best_launch, best_recovery = None, -1e18, None, None
+        # O_g(t) is built once per decision, not once per candidate walk
+        self._others_cache = self._others_of(g) if getattr(self.w, "discount_others", 0.0) > 0 else None
         for w in candidates:
-            r, launch_h, recovery_h = self.walk_reward(g, w)
+            r, launch_h, recovery_h = self.walk_reward(g, w, unclaimed)
             if r > best_r:
                 best, best_r, best_launch, best_recovery = w, r, launch_h, recovery_h
+        self._others_cache = None
         if best is None:
             return
         g.walk = best
@@ -384,6 +1047,10 @@ class Sim:
                 if h in eligible:
                     in_range = [h]
 
+        if not in_range and self.w.ghost_cap_idleness is not None and self.variant.radius_launch:
+            over = [h for h in eligible if self.idleness(h) > self.w.ghost_cap_idleness]
+            if over:
+                in_range = [max(over, key=self.idleness)]
         if not in_range:
             return
 
@@ -409,90 +1076,115 @@ class Sim:
                 self.visit(uav.target_ghost)
 
         elif uav.state == UAVState.SERVICING:
-            if self.t - uav.service_start >= uav.expected_service_time:
+            # assign a recovery UGV exactly once per cycle, after the service dwell
+            if uav.recovery_ugv is None and \
+                    self.t - uav.service_start >= uav.expected_service_time:
                 self._assign_recovery(uav)
 
         elif uav.state == UAVState.TO_RENDEZVOUS:
-            uav.pos_xy = self._move_toward(uav.pos_xy, uav.recovery_point, w.s_a)
             rg = self._ugv(uav.recovery_ugv)
-            if rg is not None and math.dist(uav.pos_xy, self.ugv_xy(rg)) <= w.eps_l \
-               and rg.pos_node == self._node_at_point(uav.recovery_point):
-                self._dock(uav, rg)
+            if rg is None:
+                return
+            if not self.variant.landing_candidate_recovery:
+                # nearest-UGV ablation: no landing point, no UGV waiting; the
+                # UAV pursues the UGV's current position until co-located
+                uav.pos_xy = self._move_toward(uav.pos_xy, self.ugv_xy(rg), w.s_a)
+                if math.dist(uav.pos_xy, self.ugv_xy(rg)) <= w.eps_l:
+                    self._dock(uav, rg)
+                return
+            uav.pos_xy = self._move_toward(uav.pos_xy, uav.recovery_point, w.s_a)
+            if math.dist(uav.pos_xy, uav.recovery_point) <= w.eps_l:
+                if self._ugv_at_landing(rg, uav):
+                    self._dock(uav, rg)
+                else:
+                    # UAV got there first: wait, holding the node at idleness 0
+                    # (Definition 1, continuous occupancy)
+                    uav.state = UAVState.WAITING_AT_RENDEZVOUS
+                    node = self._node_at_point(uav.recovery_point)
+                    if node is not None and self.occupied_since.get(node) is None:
+                        self.occupied_since[node] = self.t
 
         elif uav.state == UAVState.WAITING_AT_RENDEZVOUS:
             rg = self._ugv(uav.recovery_ugv)
-            if rg is not None and rg.pos_node == self._node_at_point(uav.recovery_point):
+            if rg is not None and self._ugv_at_landing(rg, uav):
                 self._dock(uav, rg)
 
+    def _ugv_at_landing(self, g: UGV, uav: UAV) -> bool:
+        """Co-location at the landing node: the UGV stands on it and the UAV
+        is within eps_l (Sec 3.3 step 5)."""
+        return (uav.recovery_point is not None
+                and g.edge_progress == 0.0
+                and self.pos[g.pos_node] == uav.recovery_point
+                and math.dist(uav.pos_xy, self.ugv_xy(g)) <= self.w.eps_l)
+
     def _assign_recovery(self, uav: UAV):
+        """Sec 3.3 step 3: pick (UGV, landing node) minimising TL = max(t_u, t_a)
+        over empty, unreserved UGVs and their C landing candidates."""
         w = self.w
         candidates = [g for g in self.ugvs if g.is_free]
         if not candidates:
-            return  # wait another step; stays SERVICING, continuous-occupancy holds idleness at 0
+            return  # retry next step; the UAV keeps servicing (idleness held at 0)
 
-        best = None
-        best_TL = 1e18
-        best_point = None
-        best_g = None
-
+        h = self.ghosts[uav.target_ghost]
+        best = None   # (TL, g, point, t_a)
         for g in candidates:
             if self.variant.landing_candidate_recovery:
-                points = self._landing_points(g, w.landing_candidates)
+                points = [(self.pos[node], d / w.v_g)
+                          for node, d in self._landing_points(g, w.landing_candidates)]
             else:
-                # nearest-UGV-recovery ablation: single point, the UGV's
-                # current position, no coordination with its planned path
-                points = [(g.pos_node, self.pos[g.pos_node])]
-            for node_id, p in points:
-                t_u = self._ugv_time_to_point(g, p)
-                t_a = math.dist(self.ghosts[uav.target_ghost], p) / w.s_a
+                # nearest-UGV ablation: the UGV's position right now
+                points = [(self.ugv_xy(g), 0.0)]
+            for p, t_u in points:
+                t_a = math.dist(h, p) / w.s_a
                 TL = max(t_u, t_a)
-                if TL < best_TL:
-                    best_TL, best_point, best_g = TL, p, g
-        if best_g is None:
+                if best is None or TL < best[0]:
+                    best = (TL, g, p, t_a)
+        if best is None:
             return
+        TL, g, p, t_a = best
 
-        best_g.reserved_for = uav.uid
-        best_g.reserved_point = best_point
-        t_a = math.dist(self.ghosts[uav.target_ghost], best_point) / w.s_a
-        uav.recovery_ugv = best_g.uid
-        uav.recovery_point = best_point
-        uav.depart_time = self.t + max(best_TL - t_a, 0.0)
+        g.reserved_for = uav.uid
+        g.reserved_point = p
+        uav.recovery_ugv = g.uid
+        uav.recovery_point = p
+        if self.variant.landing_candidate_recovery:
+            uav.depart_time = self.t + max(TL - t_a, 0.0)      # t_dep = TL - t_a
+        else:
+            uav.depart_time = self.t                           # leaves at once
+        uav._depart_at = uav.depart_time
         if uav.target_ghost in self.recovery_claims:
             del self.recovery_claims[uav.target_ghost]
-        uav.state = UAVState.SERVICING  # keep servicing until depart_time
-        uav._depart_at = uav.depart_time  # scheduled check in step_uav caller
 
-    def _landing_points(self, g: UGV, c: int) -> List[Tuple[str, Coord]]:
-        """Up to C distinct points along g's remaining planned path,
-        deduped -- genswarm-extension.tex Sec 3.3 step 3 (dedup version)."""
-        remaining = g.walk[g.walk_idx - 1:] if g.walk else [g.pos_node]
-        if len(remaining) < 2:
-            return [(g.pos_node, self.pos[g.pos_node])]
-        cum = [0.0]
-        for i in range(len(remaining) - 1):
-            cum.append(cum[-1] + self.edge_len[(remaining[i], remaining[i + 1])])
+    def _landing_points(self, g: UGV, c: int) -> List[Tuple[str, float]]:
+        """Landing candidates for UGV g as (ground node, path distance from the
+        UGV's current position). Targets are at path distances l/3, 2l/3, l of
+        the remaining planned path (Sec 3.3 step 3), snapped to the first node
+        at or beyond each; duplicates removed. l = 0 -> the UGV's own node."""
+        if not g.walk or g.walk_idx >= len(g.walk):
+            return [(g.pos_node, 0.0)]
+        nxt = g.walk[g.walk_idx:]
+        prev = g.walk[g.walk_idx - 1]
+        d0 = max(self.edge_len[(prev, nxt[0])] - g.edge_progress, 0.0)
+        cum = [d0]
+        for a, b in zip(nxt[:-1], nxt[1:]):
+            cum.append(cum[-1] + self.edge_len[(a, b)])
         total = cum[-1]
-        if total == 0:
-            return [(remaining[0], self.pos[remaining[0]])]
         targets = [total / 3, 2 * total / 3, total][:c]
-        points = []
-        seen = set()
+        out, seen = [], set()
         for td in targets:
-            idx = 0
-            while idx < len(cum) - 1 and cum[idx + 1] < td:
-                idx += 1
-            node = remaining[idx + 1] if idx + 1 < len(remaining) else remaining[-1]
+            idx = next((i for i, x in enumerate(cum) if x >= td - 1e-9), len(cum) - 1)
+            node = nxt[idx]
             if node not in seen:
                 seen.add(node)
-                points.append((node, self.pos[node]))
-        return points
-
-    def _ugv_time_to_point(self, g: UGV, p: Coord) -> float:
-        d_to_pos = math.dist(self.ugv_xy(g), p)
-        return d_to_pos / self.w.v_g
+                out.append((node, cum[idx]))
+        return out
 
     def _dock(self, uav: UAV, g: UGV):
-        self.occupied_since[uav.target_ghost] = None
+        # docking ends any waiting at the landing node: idleness resumes from 0
+        node = self._node_at_point(uav.recovery_point) if uav.recovery_point else None
+        if node is not None and self.occupied_since.get(node) is not None:
+            self.occupied_since[node] = None
+            self.visit(node)
         if uav.target_ghost in self.claimed_ghosts:
             del self.claimed_ghosts[uav.target_ghost]
         uav.state = UAVState.DOCKED
@@ -500,6 +1192,7 @@ class Sim:
         uav.target_ghost = None
         uav.recovery_ugv = None
         uav.recovery_point = None
+        uav._depart_at = None
         g.docked_uav = uav.uid
         g.reserved_for = None
         g.reserved_point = None
@@ -526,6 +1219,14 @@ class Sim:
     # -- per-step UGV motion ----------------------------------------------
 
     def step_ugv(self, g: UGV):
+        # Sec 3.3 steps 3-4: a UGV reserved for a rendezvous follows its walk to
+        # the landing node and waits there until the UAV arrives; the node is
+        # held at idleness 0 while it waits (Definition 1).
+        if (g.reserved_point is not None and self.variant.landing_candidate_recovery
+                and g.edge_progress == 0.0 and self.pos[g.pos_node] == g.reserved_point):
+            if self.occupied_since.get(g.pos_node) is None:
+                self.occupied_since[g.pos_node] = self.t
+            return
         if not g.walk or g.walk_idx >= len(g.walk):
             self.select_walk(g)
             return
@@ -581,6 +1282,7 @@ class Sim:
 
     def step(self):
         self._spawn_events()
+        self._update_claims()
         for g in self.ugvs:
             self.check_launch(g)
             self.step_ugv(g)
@@ -590,9 +1292,17 @@ class Sim:
                 if self.t >= uav._depart_at:
                     uav.state = UAVState.TO_RENDEZVOUS
                     self.occupied_since[uav.target_ghost] = None  # left the ghost, resumes idling
+                    self.visit(uav.target_ghost)                   # ...from 0, not from arrival
                     uav._depart_at = None
             self.step_uav(uav)
         self._log()
+        if self._track_nodes:
+            self._idle_steps += 1
+            for n in self._idle_nodes:
+                i = self.idleness(n)
+                self._idle_sum[n] += i
+                if i > self._idle_max[n]:
+                    self._idle_max[n] = i
         if self.record_traj and int(self.t / self.dt) % self.traj_stride == 0:
             self._log_traj()
         self.t += self.dt
@@ -613,6 +1323,9 @@ class Sim:
         self.metrics_log.append({
             "t": self.t,
             "mean_idleness": sum(road_idle) / len(road_idle) if road_idle else 0.0,
+            "road_max_idleness": max(road_idle) if road_idle else 0.0,
+            "priority_max_idleness": max(self.idleness(s) for s in self.priorities),
+            "priority_mean_idleness": sum(self.idleness(s) for s in self.priorities) / len(self.priorities),
             "ghost_mean_idleness": sum(ghost_idle) / len(ghost_idle) if ghost_idle else 0.0,
             "ghost_max_idleness": max(ghost_idle) if ghost_idle else 0.0,
             "event_mean_response": sum(response_times) / len(response_times) if response_times else None,
