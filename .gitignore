@@ -6,9 +6,6 @@
 !requirements.txt
 !LICENSE
 
-# paper skeleton (source + built PDF; figures come from sim/)
-!final-skeleton.tex
-!final-skeleton.pdf
 
 !sim/
 sim/*
