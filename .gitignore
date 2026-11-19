@@ -11,11 +11,14 @@ sim/*
 !sim/engine.py
 !sim/graph_layouts.py
 !sim/run_m1.py
-!sim/run_m2.py
 !sim/run_m3.py
 !sim/runner.py
+!sim/run_m1_events.py
+!sim/run_m1_table2.py
+!sim/make_event_tables.py
+!sim/plot_m1_map.py
+!sim/results_m1_events.txt
 !sim/visualize.py
-!sim/plot_maps.py
 !sim/plot_m3_map.py
 !sim/summarize_results.py
 !sim/*.csv

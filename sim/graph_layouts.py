@@ -591,3 +591,24 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def ensure_priority_coverage(G, pos, priorities, T, v_g=4.0):
+    """Formulation Sec 7.2: add priority nodes until (i) every ground node is within T/2 of a
+    priority node (Prop. 1) and (ii) every edge satisfies d(u,S)+w(u,w)+d(w,S) <= T (Prop. 2, T >= T*).
+    Greedy: repeatedly add the node farthest from the current priority set (largest d(v,S)).
+    Returns (priorities, added). A no-op when the criteria already hold."""
+    H = nx.Graph()
+    for a, b in G.edges():
+        H.add_edge(a, b, w=math.dist(pos[a], pos[b]) / v_g)
+    S = list(priorities); added = []
+    while True:
+        dm = {s: nx.single_source_dijkstra_path_length(H, s, weight="w") for s in S}
+        dS = {v: min(dm[s].get(v, math.inf) for s in S) for v in G.nodes()}
+        bad_nodes = [v for v, x in dS.items() if 2 * x > T]
+        bad_edges = [(a, b) for a, b in H.edges() if dS[a] + H[a][b]["w"] + dS[b] > T]
+        if not bad_nodes and not bad_edges:
+            return sorted(S), added
+        cand = bad_nodes or [v for e in bad_edges for v in e]
+        v = max(cand, key=lambda x: dS[x])
+        S.append(v); added.append(v)

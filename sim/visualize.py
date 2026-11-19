@@ -393,11 +393,11 @@ def main():
 
     print("building map and walk set (a few seconds)...", flush=True)
     layout = _layout(map_idx)
-    walks = _walks(map_idx, t_hops, k)
+    walks, gated_walks = _walks(map_idx, t_hops, k)
     def make_sim():
         return Sim(layout, n_ugv=n_ugv, n_uav=n_uav, variant=VARIANTS[args.variant],
                    seed=args.seed, weights=make_weights(t_hops), valid_walks=walks,
-                   track_node_idleness=True)
+                   gated_walks=gated_walks, track_node_idleness=True)
 
     sim = make_sim()
     v = Viewer(sim, layout, args.variant, args.fleet, args.vmax, args.speed,

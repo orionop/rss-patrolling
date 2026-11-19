@@ -16,7 +16,7 @@ from engine import Sim, VARIANTS, Weights, enumerate_valid_walks, build_cover_wa
 
 # Walk set (final-skeleton Sec 7): "present" = K shortest-by-hops + detours (old),
 # "cover" = covering walk set + starvation claims. Select with env WALKSET.
-WALKSET = os.environ.get("WALKSET", "present")
+WALKSET = os.environ.get("WALKSET", "cover")   # final configuration: covering walk set
 COVER_K = int(os.environ.get("COVER_K", "-1"))       # fastest walks per pair; -1 = rule K = |V_g|
 CLAIM_CAP = int(os.environ.get("CLAIM_CAP", "-1"))   # N_c; -1 = rule ceil(n_UGV |U| / |V_g|)
 
@@ -64,6 +64,7 @@ LAUNCH_I_MIN = 20.0
 
 def make_weights(t_seconds):
     return Weights(T=t_seconds, discount_others=DISCOUNT_OTHERS, ghost_units_seconds=GHOST_SEC,
+                   recovery_radius_m=(None if os.environ.get('RREC_M', '500').lower() in ('none', 'off', 'inf') else float(os.environ.get('RREC_M', '500'))),   # recovery radius (m), default 500; RREC_M=none disables
                    claim_cap=CLAIM_CAP if WALKSET == "cover" else None,
                    gate_idleness=float(os.environ["GATE_FACTOR"]) * t_seconds if os.environ.get("GATE_FACTOR") else None,
                    starve_idleness=None if STARVE_FACTOR is None else STARVE_FACTOR * t_seconds,
@@ -75,7 +76,23 @@ def make_weights(t_seconds):
 
 @lru_cache(maxsize=None)
 def _layout(map_idx):
-    return make_ladder(include_m3=False)[map_idx]
+    from graph_layouts import ensure_priority_coverage
+    lay = make_ladder(include_m3=False)[map_idx]
+    S, added = ensure_priority_coverage(lay.G, lay.pos, lay.priorities, 400.0, Weights().v_g)   # formulation Sec 7.2 criteria, T = 400 s
+    if added:
+        lay.priorities[:] = S
+        print(f"priority coverage: added {len(added)} priority nodes", flush=True)
+    k = int(os.environ.get('EXTRA_PRIO', '0'))
+    if k:   # experiment: k extra priority nodes, each the node farthest from the current set (farthest-point sampling)
+        import math, networkx as nx
+        H = nx.Graph()
+        for a, b in lay.G.edges(): H.add_edge(a, b, w=math.dist(lay.pos[a], lay.pos[b]) / Weights().v_g)
+        for _ in range(k):
+            dm = {s: nx.single_source_dijkstra_path_length(H, s, weight='w') for s in lay.priorities}
+            dS = {v: min(dm[s].get(v, math.inf) for s in lay.priorities) for v in lay.G.nodes()}
+            lay.priorities.append(max((v for v in lay.G.nodes() if v not in lay.priorities), key=lambda v: dS[v]))
+        print(f"EXTRA_PRIO: priority set now {len(lay.priorities)} nodes", flush=True)
+    return lay
 
 
 @lru_cache(maxsize=None)
@@ -119,6 +136,18 @@ def _job(args):
     sim = Sim(layout, n_ugv=n_ugv, n_uav=n_uav, variant=VARIANTS[variant_key],
               seed=seed, weights=make_weights(t_hops), valid_walks=_walks(map_idx, t_hops, k)[0],
               gated_walks=_walks(map_idx, t_hops, k)[1])
+    import math as _m
+    fd=[0.0]; ab=[0.0]; _osu=sim.step_uav
+    def _su(uav):
+        b=uav.pos_xy; fly=uav.state in ("to_ghost","to_rendezvous"); _osu(uav)
+        if fly and b is not None: fd[0]+=_m.dist(b,uav.pos_xy)
+    sim.step_uav=_su
+    _ost=sim.step
+    def _st():
+        _ost()
+        for u in sim.uavs:
+            if u.state!="docked": ab[0]+=sim.dt
+    sim.step=_st
     log = sim.run(horizon)
     row = {
         "map": map_name,
@@ -127,6 +156,7 @@ def _job(args):
         "seed": seed,
     }
     row.update({k: round(v, 2) for k, v in summarize(log).items()})
+    row['uav_km']=round(fd[0]/1000.0,3); row['airtime_s']=round(fd[0]/12.0,1); row['airborne_s']=round(ab[0],1)
     return row
 
 

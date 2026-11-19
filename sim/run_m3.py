@@ -1,57 +1,41 @@
-"""Run M3 (Boston OSM, 204 nodes) in two conditions, full method only:
-  (a) no_events  -- Sec 1-3 only, same as M1/M2's "full" variant
-  (b) with_events -- (a) plus the emergency-event layer (engine.py
-      EventConfig), severity-scaled responder diversion
-
-Fleet sizes per the agreed M3 scaling: (8,4), (10,5), (10,7) -- larger
-than M1/M2 since M3's graph is ~4x the nodes. NOT executed yet -- staged.
-
-Usage once approved:
-    python3 run_m3.py
-"""
+"""M3 (Boston OSM, cached road network), fleets 8/4 10/5 10/7, 10 seeds, T = 421 s (>= T* = 420.2 s).
+Usage: python3 run_m3.py [fleets e.g. 8-4,10-5,10-7] [seeds] [T] [out.csv]  (about 15 min on 2 cores incl. walk-set build)"""
+import sys, os, csv, time, math, multiprocessing as mp
+os.environ.setdefault("WALKSET", "cover")
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 from graph_layouts import make_ladder
-from engine import Sim, VARIANTS, EventConfig
-from runner import summarize
+from engine import Sim, VARIANTS, Weights, build_cover_walks
+from runner import make_weights, summarize
+LAY = make_ladder(include_m3=True)[2]
+KEYS = ["full", "no_ghost_credit", "fixed_launch_nodes", "nearest_ugv_recovery", "tier0_ugv_only"]
+WALKS = GATED = None
+T = 421.0
 
-HORIZON_S = 3600 * 2
-FLEET_SIZES = [(8, 4), (10, 5), (10, 7)]
-SEEDS = [0, 1, 2]
-
-CONDITIONS = {
-    "no_events": EventConfig(enabled=False),
-    "with_events": EventConfig(enabled=True, rate_per_hour=3.0,
-                                severity_min=1, severity_max=5,
-                                dwell_per_severity=15.0),
-}
-
-
-def run_all():
-    ladder = make_ladder(include_m3=True)
-    m3 = ladder[2]
-    full = VARIANTS["full"]
-    results = []
-    for n_ugv, n_uav in FLEET_SIZES:
-        for cond_key, events in CONDITIONS.items():
-            for seed in SEEDS:
-                sim = Sim(m3, n_ugv=n_ugv, n_uav=n_uav, variant=full,
-                          seed=seed, events=events)
-                log = sim.run(HORIZON_S)
-                final = log[-1] if log else {}
-                results.append({
-                    "map": "M3",
-                    "fleet": f"{n_ugv}-{n_uav}",
-                    "condition": cond_key,
-                    "seed": seed,
-                    **{k: round(v, 2) for k, v in summarize(log).items()},
-                    # event stats are cumulative over the run, so the final value is the run total
-                    "event_mean_response": final.get("event_mean_response"),
-                    "event_max_response": final.get("event_max_response"),
-                    "events_resolved": final.get("events_resolved"),
-                    "events_pending": final.get("events_pending"),
-                })
-                print(results[-1])
-    return results
-
+def job(a):
+    nu, na, vk, seed = a
+    sim = Sim(LAY, n_ugv=nu, n_uav=na, variant=VARIANTS[vk], seed=seed, weights=make_weights(T), valid_walks=WALKS, gated_walks=GATED)
+    fd = [0.0]; osu = sim.step_uav
+    def su(u):
+        b = u.pos_xy; fly = u.state in ("to_ghost", "to_rendezvous"); osu(u)
+        if fly and b is not None: fd[0] += math.dist(b, u.pos_xy)
+    sim.step_uav = su
+    row = {"map": "M3", "fleet": f"{nu}-{na}", "variant": vk, "seed": seed, "T": round(T, 2)}
+    row.update({k: round(v, 2) for k, v in summarize(sim.run(7200)).items()})
+    row["airtime_s"] = round(fd[0] / 12.0, 1)      # flying time: distance / 12 m/s
+    return row
 
 if __name__ == "__main__":
-    run_all()
+    fleets = [tuple(map(int, f.split("-"))) for f in (sys.argv[1] if len(sys.argv) > 1 else "8-4,10-5,10-7").split(",")]
+    nseeds = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+    T = float(sys.argv[3]) if len(sys.argv) > 3 else 421.0
+    out = sys.argv[4] if len(sys.argv) > 4 else "results_m3_cover.csv"
+    WALKS, st = build_cover_walks(LAY.G, LAY.priorities, T, LAY.pos, Weights().v_g, K=-1, ghosts=LAY.ghosts, r_max=Weights().r_max)
+    GATED = set(st["gated"])
+    jobs = [(nu, na, vk, s) for nu, na in fleets for vk in KEYS for s in range(nseeds)]
+    rows = []
+    with mp.get_context("fork").Pool() as p:
+        for r in p.imap_unordered(job, jobs):
+            rows.append(r); print(len(rows), "/", len(jobs), r["fleet"], r["variant"], r["seed"], flush=True)
+    with open(out, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
+    print("saved", out)

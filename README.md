@@ -4,38 +4,68 @@ Simulation code for a TPBP (Time-Period-Based Patrolling) extension to
 heterogeneous ground-air robot teams: UGVs run the original TPBP
 walk-selection rule unchanged; UAVs launch from UGVs to service
 air-only ("ghost") nodes and are recovered by a UGV afterward. This
-repo holds only the code behind the paper's results — no stale
+repo holds only the code behind the paper's results: no stale
 experiments, renders, or planning scaffolding.
+
+## Current state (2026-11-19)
+
+- Maps: **M1** (10x10 grid) and **M3** (Boston OSM). M2 (thinned near-tree
+  grid, 4 independent cycles) is out of scope: the credits act through walk and
+  landing-point choice, which a near-tree does not offer. M2 code and results
+  are archived outside this repo.
+- UAV flight limits: launch within r_max = 70 m; recovery UGV and landing node
+  within r_rec = 500 m of the air-only node (nearest-UGV baseline: the chosen
+  UGV stops until the UAV lands); air-only cap launch only from a carrier
+  within r_rec, closest docked UAV only; flight to an event only if the
+  carrier is within r_rec.
+- Emergency events (`EventConfig(mode="dispatch")` in `sim/engine.py`): one
+  event per run at t0 = H/2, severity 1-3, quota
+  q = ceil(n_ref (sigma-1)/(sigma_max-1)) with n_ref = 2 UGV / 2 UAV, work
+  W = (q_g + q_a) T, response mandatory (open slots refilled every step,
+  courier UGV if no UAV is in range). `freeze_for` gives the frozen-fleet
+  counterfactual.
+
+```bash
+cd sim
+python3 run_m1_table2.py 30            # M1: Table 1 (no event) + Table 2 (event) + frozen check
+MAP=M3 python3 run_m1_table2.py 30     # M3, same
+python3 run_m1_events.py 4-2,6-3 30 > results_m1_events.txt   # responder selection (V4, V5)
+python3 make_event_tables.py results_m1_events.txt > tables.tex  # LaTeX tables for the paper
+python3 plot_m1_map.py                 # M1 figure
+```
+
+Results (30 seeds): `sim/results_m1_table2.csv`, `sim/results_m3_table2.csv`,
+`sim/results_m1_events.csv`, `sim/results_m1_events.txt`.
+
+Sections below are the development history; M2 mentions there are historical.
 
 ## Files
 
-- `sim/engine.py` — the simulation engine. Implements the unmodified
+- `sim/engine.py`: the simulation engine. Implements the unmodified
   TPBP walk enumeration and reward (`enumerate_valid_walks`,
   `walk_reward`), plus the extension's ghost-credit and
   recovery-credit reward terms, the UAV launch/recovery state
   machine, and the `Sim` class that steps UGVs and UAVs together.
   `VARIANTS` defines the 5 configurations compared in the paper:
-  - `tier0_ugv_only` — floor: original TPBP, no UAVs at all.
-  - `full` — proposed method, all mechanisms on.
-  - `no_ghost_credit` — ablation: drop the ghost-credit reward term.
-  - `fixed_launch_nodes` — ablation: UAVs launch from fixed nodes
+  - `tier0_ugv_only`: floor: original TPBP, no UAVs at all.
+  - `full`: proposed method, all mechanisms on.
+  - `no_ghost_credit`: ablation: drop the ghost-credit reward term.
+  - `fixed_launch_nodes`: ablation: UAVs launch from fixed nodes
     instead of the nearest-unclaimed-ghost rule.
-  - `nearest_ugv_recovery` — ablation: recover a flown UAV with the
+  - `nearest_ugv_recovery`: ablation: recover a flown UAV with the
     nearest UGV instead of the coordinated recovery-credit rule.
-- `sim/graph_layouts.py` — map construction. Builds the M1 (7x7 dense
-  grid) and M2 (same nodes/priorities/ghosts, edges thinned toward a
-  near-spanning-tree, with a connectivity guard so thinning can't
-  orphan a ghost) layouts, plus the M3 loader for a real Boston OSM
-  road network.
-- `sim/run_m1.py`, `sim/run_m2.py` — run all 5 variants on M1/M2 at
-  two fleet sizes (4 UGV/2 UAV and 6 UGV/3 UAV), 3 seeds each.
-- `sim/run_m3.py` — runs the proposed method on the real-road M3 map
+- `sim/graph_layouts.py`: map construction (M1 grid, M3 loader for the
+  Boston OSM road network; the ladder also builds the archived M2 layout).
+- `sim/run_m1.py`: runs all 5 variants on M1.
+- `sim/run_m3.py`: runs the proposed method on the real-road M3 map
   across fleet sizes and emergency-event conditions.
 
-- `sim/runner.py` — shared batch runner used by `run_m1.py` / `run_m2.py`
+- `sim/runner.py`: shared batch runner used by `run_m1.py`
   (parallel runs, progress lines, CSV output, time-averaged idleness).
-- `sim/plot_maps.py` — draws the M1/M2 maps to PNG/PDF.
-- `sim/visualize.py` — live visual simulation with per-node idleness
+- `sim/run_m1_table2.py`, `sim/run_m1_events.py`, `sim/make_event_tables.py`
+ : event experiments and paper tables (see "Current state").
+- `sim/plot_m1_map.py`: draws the M1 map to PDF.
+- `sim/visualize.py`: live visual simulation with per-node idleness
   (see "Visual simulation" below).
 
 ## Setup
@@ -49,7 +79,6 @@ pip install -r requirements.txt
 ```bash
 cd sim
 python3 run_m1.py   # dense grid
-python3 run_m2.py   # sparse grid (same nodes as M1, thinned edges)
 python3 run_m3.py   # real Boston road network
 ```
 
@@ -62,7 +91,7 @@ variant/fleet-size combination.
 ```bash
 cd sim
 python3 visualize.py                                   # M1, full method, fleet 4-2, seed 0
-python3 visualize.py --map m2 --variant fixed_launch_nodes --fleet 6-3 --seed 1
+python3 visualize.py --variant fixed_launch_nodes --fleet 6-3 --seed 1
 python3 visualize.py --save m1.gif --no-show           # render to a file, no window
 python3 visualize.py --no-show --node-csv node_idleness.csv   # headless, per-node CSV
 ```
